@@ -1,23 +1,62 @@
-- name: Setup Node.js environment
-  uses: actions/setup-node@v4.0.0
-  with:
-    # Set always-auth in npmrc.
-    always-auth: # optional, default is false
-    # Version Spec of the version to use. Examples: 12.x, 10.15.1, >=10.15.0.
-    node-version: # optional
-    # File containing the version Spec of the version to use.  Examples: .nvmrc, .node-version, .tool-versions.
-    node-version-file: # optional
-    # Target architecture for Node to use. Examples: x86, x64. Will use system architecture by default.
-    architecture: # optional
-    # Set this option if you want the action to check for the latest available version that satisfies the version spec.
-    check-latest: # optional
-    # Optional registry to set up for auth. Will set the registry in a project level .npmrc and .yarnrc file, and set up auth to read in from env.NODE_AUTH_TOKEN.
-    registry-url: # optional
-    # Optional scope for authenticating against scoped registries. Will fall back to the repository owner when using the GitHub Packages registry (https://npm.pkg.github.com/).
-    scope: # optional
-    # Used to pull node distributions from node-versions. Since there's a default, this is typically not supplied by the user. When running this action on github.com, the default value is sufficient. When running on GHES, you can pass a personal access token for github.com if you are experiencing rate limiting.
-    token: # optional, default is ${{ github.server_url == 'https://github.com' && github.token || '' }}
-    # Used to specify a package manager for caching in the default directory. Supported values: npm, yarn, pnpm.
-    cache: # optional
-    # Used to specify the path to a dependency file: package-lock.json, yarn.lock, etc. Supports wildcards or a list of file names for caching multiple dependencies.
-    cache-dependency-path: # optional
+name: Build and Deploy
+
+on:
+  push:
+    branches: ['dev']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create commit hash
+        id: commit
+        uses: pr-mpt/actions-commit-hash@v2
+      - name: Docker Login
+        uses: docker/login-action@v2.2.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - name: Docker Setup Buildx
+        uses: docker/setup-buildx-action@v2.9.1
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v4.1.1
+        with:
+          push: true
+          tags: bbengamin/bakery-delivery:${{ steps.commit.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          file: docker/config/Dockerfile.prod
+          build-args: |
+            VUE_APP_MAPBOX_API_KEY=${{ secrets.VUE_APP_MAPBOX_API_KEY }}
+            VUE_APP_API_URL=${{ vars.VUE_APP_API_URL }}
+            VUE_APP_FLAGSMITH_URL=${{ vars.VUE_APP_FLAGSMITH_URL }}
+            VUE_APP_FLAGSMITH_API_KEY=${{ secrets.VUE_APP_FLAGSMITH_API_KEY }}
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create commit hash
+        id: commit
+        uses: pr-mpt/actions-commit-hash@v2
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ vars.SSH_HOST }}
+          username: ${{ vars.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ vars.SSH_PORT }}
+          script: |
+            echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login --username ${{ vars.DOCKERHUB_USERNAME }} --password-stdin
+            docker pull bbengamin/bakery-delivery:${{ steps.commit.outputs.short }}
+            docker stop bakery-delivery
+            docker rm bakery-delivery
+            
+            docker run --name bakery-delivery \
+              -e APP_PORT=2000 \
+              -e VUE_APP_API_URL=${{ vars.VUE_APP_API_URL }} \
+              -e VUE_APP_MAPBOX_API_KEY=${{ secrets.VUE_APP_MAPBOX_API_KEY }} \
+              -p ${{ vars.APP_PORT }}:80 \
+              --restart unless-stopped \
+              -d \
+              bbengamin/bakery-delivery:${{ steps.commit.outputs.short }}
